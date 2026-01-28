@@ -114,8 +114,8 @@ This creates:
 
 ```bash
 # Clone repository
-git clone <repository-url>
-cd fv-sec-001-software-engineer-challenge
+git clone https://github.com/doccing/data-processing.git
+cd data-processing
 
 # Install dependencies
 pip install -r requirements.txt
@@ -128,8 +128,8 @@ python aggregator_optimized.py --help
 
 ```bash
 # Clone repository
-git clone <repository-url>
-cd fv-sec-001-software-engineer-challenge
+git clone https://github.com/doccing/data-processing.git
+cd data-processing
 
 # Build Docker image
 docker build --target runtime -t ad-aggregator .

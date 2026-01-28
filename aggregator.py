@@ -3,11 +3,12 @@
 Ad Performance Aggregator
 
 Optimizations applied:
-1. Vectorized accumulator updates (no iterrows loops)
-2. Pre-allocated numpy arrays for aggregation
-3. Efficient ranking without DataFrame reconstruction
-4. Optimized CSV output with buffering
-5. Reduced function call overhead in hot paths
+1. Vectorized accumulator updates (itertuples instead of iterrows)
+2. Single-pass numeric conversion with parse error detection
+3. Vectorized array operations for result building
+4. Efficient ranking without DataFrame reconstruction
+5. Optimized CSV output with buffering
+6. Reduced function call overhead in hot paths
 
 Target: 500K+ rows/second in Docker
 """
@@ -35,13 +36,14 @@ logger = logging.getLogger(__name__)
 
 class Aggregator:
     """
-    aggregator using vectorized operations.
+    Aggregator using vectorized operations.
 
     Key optimizations:
-    - Uses groupby().apply() with vectorized dict updates
+    - Uses groupby().sum() with itertuples() for fast dict updates
     - Pre-allocates numpy arrays for fast aggregation
-    - Avoids iterrows() which is extremely slow
-    - Inlines critical path operations
+    - Avoids iterrows() (uses itertuples() and vectorized operations instead)
+    - Single-pass numeric conversion with parse error detection
+    - Vectorized array operations for result building
     """
 
     def __init__(self, progress_every: int = 5_000_000, chunksize: int = 1_000_000):
@@ -118,33 +120,28 @@ class Aggregator:
             if 'campaign_id' in chunk.columns:
                 chunk['campaign_id'] = chunk['campaign_id'].astype(str).str.strip()
 
-            # Track parse errors: detect non-numeric strings (VECTORIZED)
-            # Only check columns that are string type
+            # Track parse errors and convert to numeric in one pass (TRULY VECTORIZED)
             parse_error_mask = pd.Series([False] * len(chunk), index=chunk.index)
 
             for col in ['impressions', 'clicks', 'spend', 'conversions']:
-                if col in chunk.columns and ptypes.is_string_dtype(chunk[col]):
-                    # Vectorized check: find non-empty strings that can't be converted to float
-                    # 1. Check if value is a non-empty string
-                    is_string = chunk[col].apply(lambda x: isinstance(x, str) and x.strip() != '')
-                    # 2. For those strings, try conversion and catch errors
-                    if is_string.any():
-                        string_vals = chunk[col][is_string]
-                        # Try to convert - values that fail are parse errors
-                        converted = pd.to_numeric(string_vals, errors='coerce')
-                        # Parse errors where conversion resulted in NaN
-                        parse_error_indices = converted.isna()
-                        # Update the main mask
-                        parse_error_mask[is_string] |= parse_error_indices
+                if col not in chunk.columns:
+                    continue
+
+                # Store original values for parse error detection
+                original_values = chunk[col].copy()
+
+                # Convert to numeric (coerce errors to NaN)
+                chunk[col] = pd.to_numeric(chunk[col], errors='coerce')
+
+                # Detect parse errors: values that were strings but failed to convert
+                if ptypes.is_string_dtype(original_values):
+                    # Vectorized check: find non-empty strings
+                    is_non_empty_string = original_values.astype(str).str.strip().ne('') & (original_values != 'nan')
+                    # Parse errors where: was a non-empty string AND conversion resulted in NaN
+                    parse_error_mask |= (is_non_empty_string & chunk[col].isna())
 
             # Count parse errors (rows with non-numeric strings)
             self.stats['parse_errors'] += int(parse_error_mask.sum())
-
-            # Convert to numeric (coerce errors to NaN)
-            chunk['impressions'] = pd.to_numeric(chunk['impressions'], errors='coerce')
-            chunk['clicks'] = pd.to_numeric(chunk['clicks'], errors='coerce')
-            chunk['spend'] = pd.to_numeric(chunk['spend'], errors='coerce')
-            chunk['conversions'] = pd.to_numeric(chunk['conversions'], errors='coerce')
 
             # Filter invalid rows (vectorized)
             valid_mask = (
@@ -174,13 +171,14 @@ class Aggregator:
                 ['impressions', 'clicks', 'spend', 'conversions']
             ].sum()
 
-            # Fast dict update (vectorized)
-            for campaign_id, row in grouped.iterrows():
+            # Fast dict update - use itertuples() instead of iterrows() (10-20x faster)
+            for row in grouped.itertuples():
+                campaign_id = row.Index
                 acc = accumulator[campaign_id]
-                acc['impressions'] += int(row['impressions'])
-                acc['clicks'] += int(row['clicks'])
-                acc['spend'] += float(row['spend'])
-                acc['conversions'] += int(row['conversions'])
+                acc['impressions'] += int(row.impressions)
+                acc['clicks'] += int(row.clicks)
+                acc['spend'] += float(row.spend)
+                acc['conversions'] += int(row.conversions)
 
         # Final stats
         elapsed = time.time() - start_time
@@ -222,21 +220,40 @@ class Aggregator:
             ascending=[False, False, False, True]
         )
 
-        # Extract top 10 as list of tuples
+        # Extract top 10 as list of tuples (vectorized)
         top_10 = df_sorted.head(10)
 
-        result = []
-        for _, row in top_10.iterrows():
-            cpa = row['spend'] / row['conversions'] if row['conversions'] > 0 else None
-            result.append((
-                row['campaign_id'],
-                int(row['impressions']),
-                int(row['clicks']),
-                float(row['spend']),
-                int(row['conversions']),
-                float(row['CTR']),
-                cpa
-            ))
+        # Vectorized CPA calculation
+        conversions_array = top_10['conversions'].values
+        spend_array = top_10['spend'].values
+        cpa_array = np.divide(
+            spend_array,
+            conversions_array,
+            out=np.full_like(spend_array, np.nan, dtype=float),
+            where=conversions_array > 0
+        )
+
+        # Build result using zip on arrays (much faster than iterrows)
+        result = [
+            (
+                cid,
+                int(imp),
+                int(clk),
+                float(spd),
+                int(conv),
+                float(ctr),
+                float(cpa) if not np.isnan(cpa) else None
+            )
+            for cid, imp, clk, spd, conv, ctr, cpa in zip(
+                top_10['campaign_id'].values,
+                top_10['impressions'].values,
+                top_10['clicks'].values,
+                top_10['spend'].values,
+                top_10['conversions'].values,
+                top_10['CTR'].values,
+                cpa_array
+            )
+        ]
 
         return result
 
@@ -282,17 +299,27 @@ class Aggregator:
 
         top_10 = df_sorted.head(10)
 
-        result = []
-        for _, row in top_10.iterrows():
-            result.append((
-                row['campaign_id'],
-                int(row['impressions']),
-                int(row['clicks']),
-                float(row['spend']),
-                int(row['conversions']),
-                float(row['CTR']),
-                float(row['CPA'])
-            ))
+        # Build result using zip on arrays (much faster than iterrows)
+        result = [
+            (
+                cid,
+                int(imp),
+                int(clk),
+                float(spd),
+                int(conv),
+                float(ctr),
+                float(cpa)
+            )
+            for cid, imp, clk, spd, conv, ctr, cpa in zip(
+                top_10['campaign_id'].values,
+                top_10['impressions'].values,
+                top_10['clicks'].values,
+                top_10['spend'].values,
+                top_10['conversions'].values,
+                top_10['CTR'].values,
+                top_10['CPA'].values
+            )
+        ]
 
         return result
 
@@ -343,8 +370,8 @@ Examples:
   python aggregator.py -i ad_data.csv -o results/ --chunksize 2000000
 
 Optimizations:
-  - Vectorized accumulator updates
-  - No iterrows() loops
+  - Vectorized accumulator updates (itertuples not iterrows)
+  - Single-pass numeric conversion
   - Efficient ranking algorithms
   - Buffered I/O for output
 
