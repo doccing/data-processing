@@ -1,0 +1,11 @@
+# Ad Performance Aggregator - Requirements
+
+# Core dependencies for optimized version
+pandas>=2.0.0
+
+# For development and testing
+pytest>=8.0.0
+
+# For measuring memory usage and performance monitoring
+psutil>=6.0.0
+memory-profiler>=0.61.0

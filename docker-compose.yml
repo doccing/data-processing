@@ -1,0 +1,35 @@
+services:
+  aggregator:
+    build:
+      context: .
+    image: ad-aggregator:latest
+    volumes:
+      - ./data:/data:ro
+      - ./results:/out
+    command:
+      - --input=/data/ad_data.csv
+      - --output=/out
+      - --chunksize=1000000
+
+  test:
+    build:
+      context: .
+    image: ad-aggregator:latest
+    volumes:
+      - ./test_data:/data:ro
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["test_aggregator.py", "-v"]
+
+  benchmark:
+    build:
+      context: .
+    image: ad-aggregator:latest
+    volumes:
+      - ./data:/data:ro
+      - ./results:/out
+    entrypoint: ["python", "benchmark.py"]
+    command:
+      - -i=/data/ad_data.csv
+      - -o=/out
+      - --chunksize=1000000
+      - --profile-memory
