@@ -132,7 +132,7 @@ git clone https://github.com/doccing/data-processing.git
 cd data-processing
 
 # Build Docker image
-docker build --target runtime -t ad-aggregator .
+docker build -t ad-aggregator .
 
 # Run with Docker (see Docker section below)
 ```
